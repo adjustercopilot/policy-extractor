@@ -1,5 +1,4 @@
 import streamlit as st
-import requests
 import json
 import os
 from pathlib import Path
@@ -13,9 +12,21 @@ import plotly.graph_objects as go
 import plotly.express as px
 import traceback
 import re
+import google.generativeai as genai
 
-# API Configuration
-API_URL = "http://127.0.0.1:8000"
+# Load environment variables
+from dotenv import load_dotenv
+load_dotenv()
+
+# Configure Gemini
+API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not API_KEY:
+    st.error("❌ GEMINI_API_KEY not found in .env file")
+    st.stop()
+
+genai.configure(api_key=API_KEY)
+model = genai.GenerativeModel("gemini-2.5-flash")
 
 # Page configuration
 st.set_page_config(
@@ -369,151 +380,158 @@ def initialize_session_state():
         st.session_state.last_error = None
     if "conversation_context" not in st.session_state:
         st.session_state.conversation_context = []
+    if "document_text" not in st.session_state:
+        st.session_state.document_text = None
 
-def show_error_details(error: Dict[str, Any]):
-    """Display detailed error information"""
-    st.markdown("""
-    <div class="error-message">
-        <strong>Error Processing Document</strong><br>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    st.error(error.get("message", "An unknown error occurred"))
-    
-    with st.expander("View Error Details", expanded=True):
-        if "status_code" in error:
-            st.markdown(f"**Status Code:** `{error['status_code']}`")
-        
-        if "error_type" in error:
-            st.markdown(f"**Error Type:** `{error['error_type']}`")
-        
-        if "details" in error:
-            st.markdown("**Error Details:**")
-            st.code(error["details"], language="json")
-        
-        if "api_response" in error:
-            st.markdown("**API Response:**")
-            st.json(error["api_response"])
-        
-        if "traceback" in error:
-            st.markdown("**Traceback:**")
-            st.code(error["traceback"], language="python")
-        
-        st.markdown("---")
-        st.markdown("**Troubleshooting Tips:**")
-        
-        if error.get("status_code") == 500:
-            st.markdown("- Check if the Gemini API key is valid in your backend")
-            st.markdown("- Verify the PDF file is readable and not corrupted")
-            st.markdown("- Check the backend logs for more details")
-        elif error.get("status_code") == 400:
-            st.markdown("- The file format might not be supported")
-            st.markdown("- Check if the file is a valid PDF")
-        elif error.get("status_code") == 404:
-            st.markdown("- Make sure the backend server is running")
-            st.markdown("- Check if the API endpoint URL is correct")
-        elif error.get("status_code") == 413:
-            st.markdown("- The file is too large for processing")
-            st.markdown("- Try compressing the PDF file")
-        elif error.get("status_code") == 429:
-            st.markdown("- Rate limit exceeded. Please wait and try again")
-            st.markdown("- Check your API quota limits")
-        elif error.get("status_code") == 503:
-            st.markdown("- Backend service is unavailable")
-            st.markdown("- Check if the FastAPI server is running")
-        else:
-            st.markdown("- Verify the backend server is running at `http://127.0.0.1:8000`")
-            st.markdown("- Check the API logs for more information")
-            st.markdown("- Make sure all dependencies are installed")
+def flatten_value(value):
+    """Convert complex values to string for display in DataFrame"""
+    if value is None:
+        return ""
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, indent=2)
+    return str(value)
+
+def extract_text_from_pdf(file_bytes: bytes) -> str:
+    """Extract text from PDF file"""
+    try:
+        pdf_reader = PyPDF2.PdfReader(BytesIO(file_bytes))
+        text = "\n".join([page.extract_text() or "" for page in pdf_reader.pages])
+        return text
+    except Exception as e:
+        raise Exception(f"Failed to extract text from PDF: {str(e)}")
 
 def upload_and_extract(file, document_type: Optional[str] = None, custom_fields: Optional[str] = None) -> Dict[str, Any]:
-    """Upload file to FastAPI backend and get extraction results with detailed error handling"""
-    files = {"file": file}
-    params = {}
-    
-    if document_type and document_type != "AUTO_DETECT":
-        params["document_type"] = document_type
-    if custom_fields:
-        params["custom_fields"] = custom_fields
-    
+    """Extract data directly using Gemini AI"""
     try:
-        with st.spinner("Processing document..."):
-            response = requests.post(
-                f"{API_URL}/extract",
-                files=files,
-                params=params,
-                timeout=60
-            )
+        with st.spinner("Processing document with Gemini AI..."):
+            file_name, file_bytes, _ = file
             
-            try:
-                response_data = response.json()
-            except json.JSONDecodeError as e:
+            # Extract text from PDF
+            document_text = extract_text_from_pdf(file_bytes)
+            
+            if not document_text.strip():
                 return {
-                    "error": "Invalid response from API",
+                    "error": "No text could be extracted from the PDF",
                     "details": {
-                        "message": "API returned non-JSON response",
-                        "status_code": response.status_code,
-                        "response_text": response.text[:500],
-                        "error_type": "JSONDecodeError"
+                        "message": "The PDF might be scanned or empty",
+                        "suggestion": "Try using an OCR-enabled PDF"
                     }
                 }
             
-            if response.status_code != 200:
-                return {
-                    "error": f"API returned status code {response.status_code}",
-                    "details": {
-                        "status_code": response.status_code,
-                        "message": response_data.get("detail", response_data.get("message", "Unknown error")),
-                        "api_response": response_data
-                    }
-                }
+            # Store document text for Q&A
+            st.session_state.document_text = document_text
             
-            if "error" in response_data:
-                return {
-                    "error": response_data["error"],
-                    "details": response_data.get("details", {})
-                }
+            # Prepare custom fields instruction
+            custom_fields_instruction = ""
+            if custom_fields and custom_fields.strip():
+                custom_fields_instruction = f"""
+Important: Specifically look for these custom fields:
+{custom_fields}
+
+Include them in the extracted_data object even if you need to infer them from context."""
             
-            return response_data
+            # Document type override instruction
+            doc_type_instruction = ""
+            if document_type and document_type != "AUTO_DETECT":
+                doc_type_instruction = f"""
+Document Type: {document_type}
+The user has specified that this is a {document_type} document. Use this information to guide your extraction."""
             
-    except requests.exceptions.ConnectionError as e:
-        return {
-            "error": "Cannot connect to the API server",
-            "details": {
-                "message": str(e),
-                "error_type": "ConnectionError",
-                "suggestions": [
-                    "Make sure the backend server is running",
-                    f"Verify API URL: {API_URL}",
-                    "Check if the server is accessible"
-                ]
+            # Build extraction prompt
+            prompt = f"""
+You are an expert document extraction AI. Analyze the following document and extract key information.
+
+{document_text[:30000]}
+
+{doc_type_instruction}
+
+{custom_fields_instruction}
+
+Extract all relevant fields based on the document type. Common fields might include:
+- For INSURANCE_POLICY: policy_number, effective_date, expiration_date, insured_name, premium_amount, coverage_details
+- For DRIVING_LICENSE: license_number, full_name, date_of_birth, address, expiry_date, restrictions
+- For INVOICE: invoice_number, date, due_date, vendor_name, customer_name, total_amount, line_items
+
+Return a JSON object with EXACTLY this structure (no additional text before or after):
+{{
+  "document_type": "identified document type (e.g., INSURANCE_POLICY, DRIVING_LICENSE, INVOICE)",
+  "confidence": 0.95,
+  "reasoning": "Brief explanation of why you identified this document type and what key fields you found",
+  "extracted_data": {{
+    "field_name": "field_value",
+    "another_field": "another_value"
+  }}
+}}
+
+IMPORTANT: All values in extracted_data must be simple strings or numbers. Do NOT use nested objects or arrays.
+If you need to represent multiple values, combine them into a single string separated by commas or newlines.
+
+Guidelines:
+1. Use descriptive field names (e.g., policy_number instead of just number)
+2. Extract dates in YYYY-MM-DD format when possible
+3. Include as much relevant information as you can find
+4. For missing fields, omit them from extracted_data
+5. Set confidence between 0.0 and 1.0 based on certainty
+6. Keep field names lowercase with underscores
+7. IMPORTANT: Return ONLY valid JSON, no markdown formatting, no explanatory text outside the JSON
+"""
+
+            # Get response from Gemini
+            response = model.generate_content(prompt)
+            
+            # Extract JSON from response
+            response_text = response.text
+            
+            # Clean up markdown code blocks if present
+            response_text = re.sub(r'```json\s*', '', response_text)
+            response_text = re.sub(r'```\s*', '', response_text)
+            
+            # Find JSON object
+            match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if not match:
+                raise ValueError("Could not extract JSON from Gemini response")
+            
+            data = json.loads(match.group())
+            
+            # Validate required fields
+            if "document_type" not in data:
+                data["document_type"] = "UNKNOWN"
+            if "confidence" not in data:
+                data["confidence"] = 0.5
+            if "reasoning" not in data:
+                data["reasoning"] = "Document processed successfully"
+            if "extracted_data" not in data:
+                data["extracted_data"] = {}
+            
+            # Flatten any nested data structures in extracted_data
+            flattened_data = {}
+            for key, value in data["extracted_data"].items():
+                flattened_data[key] = flatten_value(value)
+            
+            data["extracted_data"] = flattened_data
+            
+            return {
+                "document_id": f"doc_{hash(file_name)}_{datetime.now().timestamp()}",
+                "identification": {
+                    "document_type": data["document_type"],
+                    "confidence": float(data["confidence"]),
+                    "reasoning": data["reasoning"]
+                },
+                "extracted_data": data["extracted_data"]
             }
-        }
-    except requests.exceptions.Timeout as e:
+            
+    except json.JSONDecodeError as e:
         return {
-            "error": "Request timeout - document processing took too long",
+            "error": "Failed to parse Gemini response as JSON",
             "details": {
                 "message": str(e),
-                "error_type": "Timeout",
-                "suggestions": [
-                    "Try with a smaller PDF file",
-                    "Check your network connection",
-                    "Increase the timeout in the backend"
-                ]
-            }
-        }
-    except requests.exceptions.RequestException as e:
-        return {
-            "error": f"Request failed: {str(e)}",
-            "details": {
-                "message": str(e),
-                "error_type": type(e).__name__,
-                "traceback": traceback.format_exc()
+                "response": response_text[:500] if 'response_text' in locals() else "No response",
+                "error_type": "JSONDecodeError"
             }
         }
     except Exception as e:
         return {
-            "error": f"Unexpected error: {str(e)}",
+            "error": str(e),
             "details": {
                 "message": str(e),
                 "error_type": type(e).__name__,
@@ -578,10 +596,10 @@ def answer_from_extracted_data(question: str, extracted_data: dict) -> Optional[
     
     return None
 
-def ask_question(question: str, document_id: str, chat_history: List[Dict] = None, extracted_data: Dict = None) -> str:
-    """Ask a question about the document with context from chat history and local fallback"""
+def ask_question(question: str, document_id: str, chat_history: List[Dict] = None, extracted_data: Dict = None, document_text: str = None) -> str:
+    """Ask a question using Gemini AI with document context"""
     
-    # First try to answer from locally extracted data
+    # First try to answer from locally extracted data for quick responses
     if extracted_data:
         local_answer = answer_from_extracted_data(question, extracted_data)
         if local_answer:
@@ -589,61 +607,100 @@ def ask_question(question: str, document_id: str, chat_history: List[Dict] = Non
     
     try:
         with st.spinner("Thinking..."):
-            # Prepare the request with conversation context
-            request_data = {
-                "question": question,
-                "document_id": document_id
-            }
+            # Build context from extracted data
+            extracted_context = json.dumps(extracted_data, indent=2) if extracted_data else "No extracted data available"
             
-            # Include recent chat history for context (last 8 messages)
+            # Build chat history context
+            history_context = ""
             if chat_history and len(chat_history) > 0:
-                # Format chat history for the API
-                formatted_history = []
-                for msg in chat_history[-8:]:  # Last 4 exchanges
-                    formatted_history.append({
-                        "role": msg["role"],
-                        "content": msg["content"]
-                    })
-                request_data["chat_history"] = formatted_history
-                request_data["conversation_context"] = True
+                recent_history = chat_history[-8:]  # Last 4 exchanges
+                for msg in recent_history:
+                    role = "User" if msg["role"] == "user" else "Assistant"
+                    history_context += f"{role}: {msg['content']}\n"
             
-            response = requests.post(
-                f"{API_URL}/ask",
-                json=request_data,
-                timeout=30
-            )
+            # Document text context (first 8000 chars for efficiency)
+            doc_context = ""
+            if document_text:
+                doc_context = f"\n\nFull Document Text (excerpt):\n{document_text[:8000]}"
             
-            try:
-                response_data = response.json()
-            except json.JSONDecodeError:
-                return f"Error: API returned invalid response - {response.text[:200]}"
+            # Build Q&A prompt
+            prompt = f"""
+You are DocuMind AI, an intelligent document assistant. Answer the user's question based on the document information provided.
+
+EXTRACTED DATA FROM DOCUMENT:
+{extracted_context}
+
+PREVIOUS CONVERSATION:
+{history_context if history_context else "No previous conversation"}
+
+{doc_context}
+
+USER QUESTION:
+{question}
+
+INSTRUCTIONS:
+1. Answer based ONLY on the extracted data and document text provided above
+2. If the information is not available, say "I don't have that information in the document"
+3. Be concise and helpful
+4. If you find relevant information, quote it directly
+5. For date-related questions, provide the dates in a clear format
+6. If asked for a summary, list the key fields and their values
+
+YOUR ANSWER:
+"""
             
-            if response.status_code != 200:
-                error_msg = response_data.get("detail", response_data.get("message", f"Status code: {response.status_code}"))
-                return f"Error: {error_msg}"
+            # Get response from Gemini
+            response = model.generate_content(prompt)
+            answer = response.text
             
-            answer = response_data.get("answer", "No answer received from API")
-            
-            # If API answer is not helpful, try local context again
-            if "I don't have enough information" in answer or "cannot find" in answer.lower():
-                if extracted_data:
-                    local_answer = answer_from_extracted_data(question, extracted_data)
-                    if local_answer:
-                        return local_answer
+            # Clean up answer
+            answer = answer.strip()
             
             return answer
             
-    except requests.exceptions.ConnectionError:
-        # Fallback to local answering if API is down
+    except Exception as e:
+        # Fallback to local answering if API call fails
         if extracted_data:
             local_answer = answer_from_extracted_data(question, extracted_data)
             if local_answer:
-                return local_answer + "\n\n(Note: Using local data as API is unavailable)"
-        return "Error: Cannot connect to the API server. Make sure it's running at http://127.0.0.1:8000"
-    except requests.exceptions.Timeout:
-        return "Error: Request timed out. Please try again with a simpler question"
-    except Exception as e:
+                return local_answer + f"\n\n(Note: Using local data - Gemini API error: {str(e)})"
         return f"Error: {str(e)}"
+
+def show_error_details(error: Dict[str, Any]):
+    """Display detailed error information"""
+    st.markdown("""
+    <div class="error-message">
+        <strong>Error Processing Document</strong><br>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.error(error.get("error", "An unknown error occurred"))
+    
+    with st.expander("View Error Details", expanded=True):
+        if "details" in error:
+            details = error["details"]
+            
+            if "error_type" in details:
+                st.markdown(f"**Error Type:** `{details['error_type']}`")
+            
+            if "message" in details:
+                st.markdown("**Error Details:**")
+                st.code(details["message"])
+            
+            if "traceback" in details:
+                st.markdown("**Traceback:**")
+                st.code(details["traceback"], language="python")
+            
+            if "response" in details:
+                st.markdown("**Gemini Response:**")
+                st.code(details["response"], language="json")
+        
+        st.markdown("---")
+        st.markdown("**Troubleshooting Tips:**")
+        st.markdown("- Check if your GEMINI_API_KEY is valid in the .env file")
+        st.markdown("- Make sure the PDF file is readable and contains extractable text")
+        st.markdown("- Try with a smaller PDF file (under 10MB)")
+        st.markdown("- Check your internet connection")
 
 def create_confidence_gauge(confidence: float):
     """Create a confidence gauge chart"""
@@ -710,6 +767,7 @@ def main():
         
         col1, col2 = st.columns(2)
         with col1:
+            # Fixed: Changed use_container_width to width='stretch'
             upload_button = st.button("Extract & Analyze", type="primary", use_container_width=True)
         with col2:
             clear_button = st.button("Clear Session", use_container_width=True)
@@ -721,24 +779,20 @@ def main():
             st.session_state.extracted_data = None
             st.session_state.last_error = None
             st.session_state.conversation_context = []
+            st.session_state.document_text = None
             st.rerun()
         
         st.markdown("---")
         
         st.markdown("### System Status")
-        try:
-            health = requests.get(f"{API_URL}/health", timeout=2)
-            if health.status_code == 200:
-                st.markdown(":green[API: Online]")
-                data = health.json()
-                st.caption(f"Model: {data.get('model_used', 'Unknown')}")
-                st.caption(f"Status: {data.get('status', 'OK')}")
-            else:
-                st.markdown(":red[API: Offline]")
-                st.error("API issue detected")
-        except:
-            st.markdown(":red[API: Offline]")
-            st.info("Run: python main.py to start the backend")
+        # Check Gemini API key status
+        if API_KEY:
+            st.markdown(":green[Gemini AI: Ready]")
+            st.caption("Model: gemini-2.5-flash")
+            st.caption("Powered by Google Gemini")
+        else:
+            st.markdown(":red[Gemini AI: Not Configured]")
+            st.info("Add GEMINI_API_KEY to .env file")
         
         st.markdown("---")
     
@@ -774,7 +828,7 @@ def main():
                 
                 welcome_msg = f"""Document processed successfully
 
-I've identified this as a **{result['identification']['document_type']}** with {result['identification']['confidence']:.1%} confidence.
+I've identified this as a **{result['identification']['document_type'].replace('_', ' ').title()}** with {result['identification']['confidence']:.1%} confidence.
 
 {result['identification']['reasoning']}
 
@@ -845,30 +899,56 @@ You can now ask me anything about this document. What would you like to know?"""
         tab1, tab2, tab3 = st.tabs(["Extracted Data", "Analytics", "Export"])
         
         with tab1:
-            df = pd.DataFrame(list(st.session_state.extracted_data.items()), columns=["Field", "Value"])
+            # FIXED: Convert complex values to strings before creating DataFrame
+            flat_data = {}
+            for key, value in st.session_state.extracted_data.items():
+                flat_data[key] = flatten_value(value)
+            
+            df = pd.DataFrame(list(flat_data.items()), columns=["Field", "Value"])
             st.dataframe(df, use_container_width=True, hide_index=True)
         
         with tab2:
             col1, col2 = st.columns(2)
             with col1:
-                word_counts = [len(str(v).split()) for v in st.session_state.extracted_data.values()]
-                fig = go.Figure(data=[go.Bar(
-                    x=list(st.session_state.extracted_data.keys()),
-                    y=word_counts,
-                    marker_color='#667eea'
-                )])
-                fig.update_layout(title="Word Count per Field", xaxis_title="Fields", yaxis_title="Word Count")
-                st.plotly_chart(fig, use_container_width=True)
+                # Filter out non-string values for word count
+                word_counts = []
+                field_names = []
+                for key, value in st.session_state.extracted_data.items():
+                    str_value = flatten_value(value)
+                    if str_value:
+                        word_counts.append(len(str_value.split()))
+                        field_names.append(key)
+                
+                if word_counts:
+                    fig = go.Figure(data=[go.Bar(
+                        x=field_names,
+                        y=word_counts,
+                        marker_color='#667eea'
+                    )])
+                    fig.update_layout(title="Word Count per Field", xaxis_title="Fields", yaxis_title="Word Count")
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No data available for analytics")
             with col2:
-                char_counts = [len(str(v)) for v in st.session_state.extracted_data.values()]
-                fig = go.Figure(data=[go.Pie(
-                    labels=list(st.session_state.extracted_data.keys()),
-                    values=char_counts,
-                    hole=0.3,
-                    marker_colors=['#667eea', '#764ba2', '#f093fb', '#4facfe']
-                )])
-                fig.update_layout(title="Data Size Distribution")
-                st.plotly_chart(fig, use_container_width=True)
+                char_counts = []
+                field_names_pie = []
+                for key, value in st.session_state.extracted_data.items():
+                    str_value = flatten_value(value)
+                    if str_value:
+                        char_counts.append(len(str_value))
+                        field_names_pie.append(key)
+                
+                if char_counts:
+                    fig = go.Figure(data=[go.Pie(
+                        labels=field_names_pie,
+                        values=char_counts,
+                        hole=0.3,
+                        marker_colors=['#667eea', '#764ba2', '#f093fb', '#4facfe']
+                    )])
+                    fig.update_layout(title="Data Size Distribution")
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No data available for analytics")
         
         with tab3:
             col1, col2 = st.columns(2)
@@ -882,14 +962,17 @@ You can now ask me anything about this document. What would you like to know?"""
                     use_container_width=True
                 )
             with col2:
-                csv_data = pd.DataFrame([st.session_state.extracted_data]).to_csv(index=False)
-                st.download_button(
-                    label="Download CSV",
-                    data=csv_data,
-                    file_name="extracted_data.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
+                if st.session_state.extracted_data:
+                    # Flatten data for CSV
+                    flat_csv_data = {k: flatten_value(v) for k, v in st.session_state.extracted_data.items()}
+                    csv_data = pd.DataFrame([flat_csv_data]).to_csv(index=False)
+                    st.download_button(
+                        label="Download CSV",
+                        data=csv_data,
+                        file_name="extracted_data.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
     
     st.markdown("---")
     st.markdown("### Intelligent Q&A")
@@ -925,7 +1008,8 @@ You can now ask me anything about this document. What would you like to know?"""
                     question, 
                     st.session_state.current_doc_id, 
                     st.session_state.messages[:-1],
-                    st.session_state.extracted_data
+                    st.session_state.extracted_data,
+                    st.session_state.document_text
                 )
                 st.session_state.messages.append({"role": "assistant", "content": answer})
                 st.rerun()
@@ -947,7 +1031,8 @@ You can now ask me anything about this document. What would you like to know?"""
                         suggestion, 
                         st.session_state.current_doc_id, 
                         st.session_state.messages[:-1],
-                        st.session_state.extracted_data
+                        st.session_state.extracted_data,
+                        st.session_state.document_text
                     )
                     st.session_state.messages.append({"role": "assistant", "content": answer})
                     st.rerun()
